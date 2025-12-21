@@ -1,0 +1,17 @@
+[package]
+name = "isometric"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sdl2 = { version = "0.38.0" }
+metal = "0.32.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = "0.25.8"
+lazy_static = "1.5.0"
+fastnoise-lite = "1.1.1"
+crossbeam = "0.8.4"
+rand = "0.9.2"
+datetime = "0.5.2"
+bincode = "2.0.1"
