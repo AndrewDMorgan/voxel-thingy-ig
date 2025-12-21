@@ -1,4 +1,4 @@
-use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLPrimitiveType, MTLResourceOptions, MTLSize, NSUInteger, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState};
+use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLResourceOptions, MTLSize, MTLStoreAction, MTLTextureUsage, NSUInteger, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, Texture, TextureDescriptor};
 use crate::meshing::Mesh;
 
 // this could be aligned with the alignment derive, but it's not needed
@@ -7,12 +7,28 @@ use crate::meshing::Mesh;
 // the metal float4 type has no padding between elements either
 // padding at the end doesn't really matter here (only when defining buffer sizes)
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct Float4 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
     pub w: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Default, Copy)]
+pub struct Float2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Float2 {
+    pub(crate) fn new(p0: f32, p1: f32) -> Float2 {
+        Self {
+            x: p0,
+            y: p1,
+        }
+    }
 }
 
 #[repr(C)]
@@ -28,6 +44,20 @@ impl Float4 {
     pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
         Float4 { x, y, z, w }
     }
+    
+    pub fn normalized(self) -> Self {
+        let length = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
+        if length == 0.0 {
+            Self { x: 0.0, y: 0.0, z: 0.0, w: self.w }
+        } else {
+            Self {
+                x: self.x / length,
+                y: self.y / length,
+                z: self.z / length,
+                w: self.w,
+            }
+        }
+    }
 }
 
 impl Uint4 {
@@ -37,7 +67,7 @@ impl Uint4 {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Copy)]
 pub struct Uchar4 {
     pub x: u8,
     pub y: u8,
@@ -74,10 +104,6 @@ impl ShaderHandler {
             device,
             shader,
         }
-    }
-    
-    pub fn execute<T>(&self, grid_size: MTLSize, threadgroup_size: MTLSize) -> Result<(), T> {
-        self.shader.execute(grid_size, threadgroup_size, None)
     }
     
     pub fn get_shader(&mut self) -> &mut Shader {
@@ -156,7 +182,7 @@ impl Shader {
     }
     
     /// Executes the shader with the given grid and threadgroup sizes
-    pub fn execute<'a, T>(&self, grid_size: MTLSize, threadgroup_size: MTLSize, callback: Option<Box<dyn FnOnce() -> Result<(), T> + 'a>>) -> Result<(), T> {
+    pub fn execute<'a, T>(&self, grid_size: MTLSize, threadgroup_size: MTLSize, callback: Option<impl FnOnce() -> Result<(), T> + 'a>) -> Result<(), T> {
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_state);
@@ -198,18 +224,28 @@ impl ShaderError {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Vertex {
-    pub(crate) position: [f32; 3],
-    pub(crate) normal: [f32; 3],
-    pub(crate) uv: [f32; 2],
-    pub(crate) texture_id: u32,
+    pub(crate) position: Float4,
+    pub(crate) uv: Float4,
+}
+
+impl Vertex {
+    pub fn new(position: Float4, uv: Float2) -> Self {
+        Vertex { position, uv: Float4::new(uv.x, uv.y, 0.0, 0.0) }
+    }
+}
+
+#[repr(C)]
+pub struct Float4x4 {
+    pub(crate) mvp: [[f32; 4]; 4],
 }
 
 pub struct Pipeline {
     pub pipeline_state: RenderPipelineState,
     pub command_queue: CommandQueue,
     pub vertex_buffer: Buffer,
+    pub perspective_matrix: Buffer,
 }
 
 impl Pipeline {
@@ -217,7 +253,8 @@ impl Pipeline {
                source: &str,
                vertex_function_name: &str,
                fragment_function_name: &str,
-               vertex_buffer: Vec<Vertex>,
+               vertex_buffer: &Vec<Vertex>,
+               perspective_matrix: Float4x4,
     ) -> Result<Self, ShaderError> {
         let src = std::fs::read_to_string(source)
             .map_err(|e| ShaderError { details: format!("Failed to read shader file: {}", e) })?;
@@ -237,6 +274,10 @@ impl Pipeline {
                 details: format!("Failed to locate and get function '{}' from Metal library (Please verify the name is correct): {}", fragment_function_name, e)
             })?;
         desc.set_fragment_function(Some(&func));
+        desc.color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         
         let pipeline_state = device
             .new_render_pipeline_state(&desc)
@@ -248,13 +289,20 @@ impl Pipeline {
         let vertex_buffer = device.new_buffer_with_data(
             vertex_buffer.as_ptr() as *const _,
             (size_of::<Vertex>() * vertex_buffer.len()) as u64,
-            MTLResourceOptions::CPUCacheModeDefaultCache,
+            MTLResourceOptions::StorageModeShared,
+        );
+        
+        let uniform_buffer = device.new_buffer_with_data(
+            &perspective_matrix as *const _ as *const _,
+            size_of::<Float4x4>() as u64,
+            MTLResourceOptions::StorageModeShared,
         );
         
         Ok(Pipeline {
             pipeline_state,
             command_queue,
             vertex_buffer,
+            perspective_matrix: uniform_buffer,
         })
     }
     
@@ -262,17 +310,51 @@ impl Pipeline {
         let new_buffer = self.pipeline_state.device().new_buffer_with_data(
             vertex_buffer.as_ptr() as *const _,
             (size_of::<Vertex>() * vertex_buffer.len()) as u64,
-            MTLResourceOptions::CPUCacheModeDefaultCache,
+            MTLResourceOptions::StorageModeShared,
         );
         self.vertex_buffer = new_buffer;
     }
     
-    pub fn begin_execute(&self, callback: impl FnOnce(), vertex_buffer: &Vec<Vertex>) {
+    pub fn update_perspective_matrix(&mut self, perspective_matrix: Float4x4) {
+        let ptr = self.perspective_matrix.contents() as *mut Float4x4;
+        unsafe { *ptr = perspective_matrix; }
+    }
+    
+    pub fn execute(&self, callback: impl FnOnce(),
+                   vertex_buffer: &Vec<Vertex>,
+                   width: u32,
+                   height: u32,
+                   device: &Device
+    ) {
+        let texture_desc = TextureDescriptor::new();
+        texture_desc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        texture_desc.set_width(width as u64);
+        texture_desc.set_height(height as u64);
+        texture_desc.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        let texture = device.new_texture(&texture_desc);
+        
         let render_pass = RenderPassDescriptor::new();
+        render_pass.color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_texture(Some(texture.as_ref()));
+        render_pass.color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_load_action(MTLLoadAction::Clear);
+        render_pass.color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_store_action(MTLStoreAction::Store);
+        render_pass.color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
         let cmd = self.command_queue.new_command_buffer();
         let encoder = cmd.new_render_command_encoder(&render_pass);
         encoder.set_render_pipeline_state(&self.pipeline_state);
         encoder.set_vertex_buffer(0, Some(&self.vertex_buffer), 0);
+        encoder.set_vertex_buffer(1, Some(&self.perspective_matrix), 0);
         encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_buffer.len() as NSUInteger);
         encoder.end_encoding();
         cmd.commit();

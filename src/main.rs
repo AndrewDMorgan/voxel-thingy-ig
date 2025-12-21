@@ -1,5 +1,6 @@
 mod shader_handling;
 mod meshing;
+mod chunk;
 
 use metal::Device;
 use sdl2::render::{TextureAccess, TextureCreator};
@@ -7,8 +8,9 @@ use sdl2::pixels::PixelFormatEnum;
 use sdl2::video::WindowContext;
 use sdl2::rect::Rect;
 use shader_handling::{ShaderHandler, Shader};
-use crate::meshing::Mesh;
-use crate::shader_handling::{Float4, Uchar4, Uint4};
+use crate::meshing::{Mesh};
+use crate::chunk::{generate_cube, Chunk};
+use crate::shader_handling::{Float4, Float4x4, Pipeline, Uchar4, Uint4, Vertex};
 
 /// The starting width of the application window
 static WINDOW_START_WIDTH: u32 = 1200;
@@ -25,8 +27,8 @@ static MAXIMUM_WINDOW_HEIGHT: u64 = 4096u64;
 
 static _GAME_VERSION: &'static str = "0.0.1-alpha";
 
-static MAX_VERTICES: u64 = 10000_u64;
-static MAX_TRIANGLES: u64 = 10000_u64;
+static MAX_VERTICES: u64 = 250_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
+static MAX_TRIANGLES: u64 = 94_000_u64;
 static MAX_TEXTURES: u64 = 1024_u64;
 
 static TILE_TEXTURE_WIDTH: u64 = 16u64;
@@ -67,12 +69,6 @@ pub fn main() -> Result<(), String> {
     
     let mut event_pump = sdl.event_pump()?;
     
-    /*// shader stuff (looks so much better when it's wrapped up in its own handler)
-    let device = Device::system_default()
-        .ok_or_else(|| String::from("Failed to get system default device"))?;
-    let shaders = shader_loader::load_game_shaders(&device, (device_width as u32, device_height as u32), logs)?;
-    let mut shader_handler = shader_handler::ShaderHandler::new(device, [shaders]);*/
-    
     let device = Device::system_default().unwrap();
     let shader = Shader::new(&device, "shaders/triangles.metal", &[
         size_of::<u32   >() as u64,
@@ -90,50 +86,61 @@ pub fn main() -> Result<(), String> {
     ], "ComputeShader")?;
     let mut shader_handler = ShaderHandler::new(device, shader);
     
+    let mut texture = vec![];
+    for i in 0..=255 {
+        if i / 16 > 4 {
+            texture.push(Uchar4::new(150, 75, 10, 0));
+        } else {
+            texture.push(Uchar4::new(75, 225, 75, 0));
+        }
+    }
+    for i in 0..=255 {
+        texture.push(Uchar4::new(75, 225, 75, 0));
+    }
+    for i in 0..=255 {
+        texture.push(Uchar4::new(150, 75, 10, 0));
+    }
+    shader_handler.get_shader().update_buffer_slice(9, &texture)?;
+    
+    
     let mut camera_position = Float4::new(0.0, 0.0, 0.0, 0.0);
     let mut camera_rotation = Float4::new(0.0, 0.0, 0.0, 0.0);
-    let mut vertex_buffer: Vec<Float4> = vec![
-        Float4::new(0.5 * 500.0, 0.5 * 500.0, 1.0, 0.0),
-        Float4::new(0.6 * 500.0, 0.9 * 500.0, 2.0, 0.0),
-        Float4::new(0.9 * 500.0, 0.9 * 500.0, 3.0, 0.0),
-    ];
-    let mut triangles_buffer: Vec<Uint4> = vec![
-        Uint4::new(0, 1, 2, 0),  // the last one is the normal
-    ];
+    let mut vertex_buffer: Vec<Vertex> = vec![];
+    let mut triangles_buffer: Vec<Uint4> = vec![];
     let mut normals: Vec<Float4> = vec![
-        Float4::new(0.0, 0.0, -1.0, 0.0),
+        Float4::new( 0.0,  1.0,  0.0, 0.0),
+        Float4::new( 0.0, -1.0,  0.0, 0.0),
+        Float4::new( 1.0,  0.0,  0.0, 0.0),
+        Float4::new(-1.0,  0.0,  0.0, 0.0),
+        Float4::new( 0.0,  0.0,  1.0, 0.0),
+        Float4::new( 0.0,  0.0, -1.0, 0.0),
     ];
-    
-    for _ in 0..100 {
-        let x_1 = rand::random_range(0.0..200.0);
-        let y_1 = rand::random_range(0.0..200.0);
-        let z_1 = rand::random_range(0.0..200.0);
-        
-        let x_2 = rand::random_range(0.0..1200.0);
-        let y_2 = rand::random_range(0.0..1200.0);
-        let z_2 = rand::random_range(0.0..1200.0);
-        
-        let x_3 = rand::random_range(0.0..1200.0);
-        let y_3 = rand::random_range(0.0..1200.0);
-        let z_3 = rand::random_range(0.0..1200.0);
-        
-        let id = vertex_buffer.len() as u32;
-        vertex_buffer.push(Float4::new(x_1, y_1, z_1, 0.0));
-        vertex_buffer.push(Float4::new(x_2, y_2, z_2, 0.0));
-        vertex_buffer.push(Float4::new(x_3, y_3, z_3, 0.0));
-        triangles_buffer.push(Uint4::new(id, id + 1, id + 2, 0));
-    }
     
     let depth_buffer = vec![f32::MAX; const { (MAXIMUM_WINDOW_WIDTH * MAXIMUM_WINDOW_HEIGHT) as usize }];
     
     let mut mesh = Mesh {
-        vertices_original: vertex_buffer.iter().map(|v| [v.x, v.y, v.z]).collect(),
+        vertices_original: vertex_buffer.clone(),
         vertices: vertex_buffer,
         indices: triangles_buffer,
         normals,
         binned_indices: vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
         mutated: true,
     };
+    for chunk_x in 0..3 {
+        for chunk_z in 0..3 {
+            let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0));
+            for x in 0..16 {
+                for z in 0..16 {
+                    for y in 0..rand::random_range(2..4) {
+                        chunk.tile_data[x][y][z] = 1;  // setting some tiles to be solid
+                    }
+                }
+            }
+            chunk.remesh_chunk(&mut mesh, 50.0);
+        }
+    }
+    println!("Mesh has {} vertices and {} triangles.", mesh.vertices_original.len(), mesh.indices.len());
+    std::thread::sleep(std::time::Duration::from_secs(5));
     
     // --- Main loop ---
     'running: loop {
@@ -165,6 +172,22 @@ pub fn main() -> Result<(), String> {
                             },
                             sdl2::keyboard::Keycode::LSHIFT => {
                                 camera_position.y -= 10.0;
+                                mesh.mutated = true;
+                            },
+                            sdl2::keyboard::Keycode::Left => {
+                                camera_rotation.y += 0.1;
+                                mesh.mutated = true;
+                            },
+                            sdl2::keyboard::Keycode::Right => {
+                                camera_rotation.y -= 0.1;
+                                mesh.mutated = true;
+                            },
+                            sdl2::keyboard::Keycode::Up => {
+                                camera_rotation.x -= 0.025;
+                                mesh.mutated = true;
+                            },
+                            sdl2::keyboard::Keycode::Down => {
+                                camera_rotation.x += 0.025;
                                 mesh.mutated = true;
                             },
                             _ => {}
@@ -221,10 +244,10 @@ pub fn main() -> Result<(), String> {
             
             let execution_start = start.elapsed();
             
-            shader_handler.get_shader().execute::<()>(grid_size, thread_group_size, Some(Box::new(|| {
+            shader_handler.get_shader().execute::<()>(grid_size, thread_group_size, Some(|| {
                 // runs while rendering is happening
                 Ok(())
-            }))).unwrap();
+            })).unwrap();
             
             let execution_end = start.elapsed() - execution_start;
             
@@ -239,7 +262,6 @@ pub fn main() -> Result<(), String> {
             let total_end = start.elapsed() - execution_end - execution_start;
             println!("Buffer Upload Time: {:?}, Execution Time: {:?}, Read In Time: {:?}", execution_start, execution_end, total_end);
         })?;
-        
         // !====! No Rendering Beyond Here !====!
         
         // clearing and drawing the texture
