@@ -8,7 +8,7 @@ use sdl2::pixels::PixelFormatEnum;
 use sdl2::video::WindowContext;
 use sdl2::rect::Rect;
 use shader_handling::{ShaderHandler, Shader};
-use crate::meshing::{Mesh};
+use crate::meshing::{rotate, Mesh};
 use crate::chunk::{generate_cube, Chunk};
 use crate::shader_handling::{Float4, Float4x4, Pipeline, Uchar4, Uint4, Vertex};
 
@@ -28,7 +28,7 @@ static MAXIMUM_WINDOW_HEIGHT: u64 = 4096u64;
 static _GAME_VERSION: &'static str = "0.0.1-alpha";
 
 static MAX_VERTICES: u64 = 250_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
-static MAX_TRIANGLES: u64 = 94_000_u64;
+static MAX_TRIANGLES: u64 = 125_000_u64;
 static MAX_TEXTURES: u64 = 1024_u64;
 
 static TILE_TEXTURE_WIDTH: u64 = 16u64;
@@ -94,16 +94,15 @@ pub fn main() -> Result<(), String> {
             texture.push(Uchar4::new(75, 225, 75, 0));
         }
     }
-    for i in 0..=255 {
+    for _ in 0..=255 {
         texture.push(Uchar4::new(75, 225, 75, 0));
     }
-    for i in 0..=255 {
+    for _ in 0..=255 {
         texture.push(Uchar4::new(150, 75, 10, 0));
     }
     shader_handler.get_shader().update_buffer_slice(9, &texture)?;
     
-    
-    let mut camera_position = Float4::new(0.0, 0.0, 0.0, 0.0);
+    let mut camera_position = Float4::new(0.0, 2.0, -2.0, 0.0);
     let mut camera_rotation = Float4::new(0.0, 0.0, 0.0, 0.0);
     let mut vertex_buffer: Vec<Vertex> = vec![];
     let mut triangles_buffer: Vec<Uint4> = vec![];
@@ -120,23 +119,23 @@ pub fn main() -> Result<(), String> {
     
     let mut mesh = Mesh {
         vertices_original: vertex_buffer.clone(),
-        vertices: vertex_buffer,
+        vertices: vec![Vertex::default(); MAX_VERTICES as usize],
         indices: triangles_buffer,
         normals,
         binned_indices: vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
         mutated: true,
     };
-    for chunk_x in 0..3 {
-        for chunk_z in 0..3 {
+    for chunk_x in 0..7 {
+        for chunk_z in 0..7 {
             let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0));
             for x in 0..16 {
                 for z in 0..16 {
-                    for y in 0..rand::random_range(2..4) {
+                    for y in 0..rand::random_range(2..6) {
                         chunk.tile_data[x][y][z] = 1;  // setting some tiles to be solid
                     }
                 }
             }
-            chunk.remesh_chunk(&mut mesh, 50.0);
+            chunk.remesh_chunk(&mut mesh, 1.0);
         }
     }
     println!("Mesh has {} vertices and {} triangles.", mesh.vertices_original.len(), mesh.indices.len());
@@ -144,54 +143,60 @@ pub fn main() -> Result<(), String> {
     
     // --- Main loop ---
     'running: loop {
+        let frame_start = std::time::Instant::now();
         for event in event_pump.poll_iter() {
             match event {
                 sdl2::event::Event::Quit { .. } => break 'running,
                 sdl2::event::Event::KeyDown { keycode, .. } => {
                     if let Some(key) = keycode {
+                        let mut movement = Float4::new(0.0, 0.0, 0.0, 0.0);
                         match key {
                             sdl2::keyboard::Keycode::A => {
-                                camera_position.x -= 10.0;
+                                movement.x += 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::D => {
-                                camera_position.x += 10.0;
+                                movement.x -= 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::W => {
-                                camera_position.z += 10.0;
+                                movement.z += 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::S => {
-                                camera_position.z -= 10.0;
+                                movement.z -= 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::Space => {
-                                camera_position.y += 10.0;
+                                movement.y += 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::LSHIFT => {
-                                camera_position.y -= 10.0;
+                                movement.y -= 4.0;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::Left => {
-                                camera_rotation.y += 0.1;
-                                mesh.mutated = true;
-                            },
-                            sdl2::keyboard::Keycode::Right => {
                                 camera_rotation.y -= 0.1;
                                 mesh.mutated = true;
                             },
+                            sdl2::keyboard::Keycode::Right => {
+                                camera_rotation.y += 0.1;
+                                mesh.mutated = true;
+                            },
                             sdl2::keyboard::Keycode::Up => {
-                                camera_rotation.x -= 0.025;
+                                camera_rotation.x += 0.025;
                                 mesh.mutated = true;
                             },
                             sdl2::keyboard::Keycode::Down => {
-                                camera_rotation.x += 0.025;
+                                camera_rotation.x -= 0.025;
                                 mesh.mutated = true;
                             },
                             _ => {}
                         }
+                        let offset = rotate(movement, &camera_rotation.negate());
+                        camera_position.x += offset.x;
+                        camera_position.y += offset.y;
+                        camera_position.z += offset.z;
                     }
                 }
                 _ => {}
@@ -270,5 +275,8 @@ pub fn main() -> Result<(), String> {
 
         // flushing the screen and stuff
         window_surface.present();
+        
+        let frame_time = frame_start.elapsed();
+        println!("Frame Time: {:?}\nFPS: {}", frame_time, 1.0 / frame_time.as_secs_f32());
     } Ok(())
 }

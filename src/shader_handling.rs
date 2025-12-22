@@ -45,6 +45,15 @@ impl Float4 {
         Float4 { x, y, z, w }
     }
     
+    pub fn negate(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+            w: self.w,
+        }
+    }
+    
     pub fn normalized(self) -> Self {
         let length = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
         if length == 0.0 {
@@ -61,6 +70,15 @@ impl Float4 {
 }
 
 impl Uint4 {
+    pub fn tri_index(&self, index: usize) -> u32 {
+        match index {
+            0 => self.x,
+            1 => self.y,
+            2 => self.z,
+            _ => panic!("Index out of bounds for tri_index: {}", index),
+        }
+    }
+    
     pub fn new(x: u32, y: u32, z: u32, w: u32) -> Self {
         Uint4 { x, y, z, w }
     }
