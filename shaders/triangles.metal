@@ -7,6 +7,7 @@ float edge(const float2 v0, const float2 v1, const float2 p, const float dx, con
 struct Vertex {
     const float4 position;
     const float4 uv;
+    const float4 light;
 };
 
 kernel void ComputeShader (
@@ -47,11 +48,11 @@ kernel void ComputeShader (
     const uint base_index = (gid.x + gid.y * bin_width) * MAX_TRIANGLES_PER_BIN;
     const uint tris_in_bin = num_triangles[base_index];
     for (uint bin_id = 0; bin_id < tris_in_bin; bin_id++) {
+        // todo! sort all triangles in the bin by depth to allow current transparency
+
         const uint tri_id = num_triangles[base_index + bin_id + 1];
         const uint4 triangle = triangles_buffer[tri_id];
         const float3 triangle_normal = normals[triangle.w & 0xFFFF].xyz;
-        // I think that's working, but definitely verify bc/ I have no clue (orthographic projection makes this hard to see)
-        //if (metal::dot(triangle_normal, camera_rotation.xyz) >= 0.5) { continue; }  // continue;     make this work at some point ig
 
         device const Vertex* const tri_1 = &vertex_buffer[triangle.x];
         device const Vertex* const tri_2 = &vertex_buffer[triangle.y];
@@ -88,6 +89,7 @@ kernel void ComputeShader (
                 const float depth = v1.z * w0 + v2.z * w1 + v3.z * w2;
                 const float uv_u = 16.0 * (w0 * tri_1->uv.x + w1 * tri_2->uv.x + w2 * tri_3->uv.x);
                 const float uv_v = 16.0 * (w0 * tri_1->uv.y + w1 * tri_2->uv.y + w2 * tri_3->uv.y);
+                const float3 light = w0 * tri_1->light.xyz + w1 * tri_2->light.xyz + w2 * tri_3->light.xyz;
 
                 const uint uv_x = uint(uv_u);
                 const uint uv_y = uint(uv_v);
@@ -98,9 +100,9 @@ kernel void ComputeShader (
                 depth_buffer[depth_index] = depth;
 
                 const uint pixel_index = x * 3 + (height - y) * pitch;
-                pixels[pixel_index + 0] = uchar(texture_col.x * light_intensity);
-                pixels[pixel_index + 1] = uchar(texture_col.y * light_intensity);
-                pixels[pixel_index + 2] = uchar(texture_col.z * light_intensity);
+                pixels[pixel_index + 0] = uchar(texture_col.x * light_intensity * light.x);
+                pixels[pixel_index + 1] = uchar(texture_col.y * light_intensity * light.y);
+                pixels[pixel_index + 2] = uchar(texture_col.z * light_intensity * light.z);
             }
         }
     }

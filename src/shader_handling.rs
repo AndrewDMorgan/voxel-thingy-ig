@@ -246,11 +246,12 @@ impl ShaderError {
 pub struct Vertex {
     pub(crate) position: Float4,
     pub(crate) uv: Float4,
+    pub(crate) light: Float4,
 }
 
 impl Vertex {
-    pub fn new(position: Float4, uv: Float2) -> Self {
-        Vertex { position, uv: Float4::new(uv.x, uv.y, 0.0, 0.0) }
+    pub fn new(position: Float4, uv: Float2, light: Float4) -> Self {
+        Vertex { position, uv: Float4::new(uv.x, uv.y, 0.0, 0.0), light }
     }
 }
 

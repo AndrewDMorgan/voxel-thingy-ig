@@ -5,6 +5,7 @@ pub struct MeshDoubleBuffer {
     pub front: std::sync::Arc<parking_lot::RwLock<Mesh>>,
     pub back: std::sync::Arc<parking_lot::RwLock<Mesh>>,
     pub current_front: std::sync::Arc<parking_lot::RwLock<bool>>,
+    pub swapping: std::sync::Arc<parking_lot::RwLock<bool>>,
 }
 
 impl MeshDoubleBuffer {
@@ -25,8 +26,17 @@ impl MeshDoubleBuffer {
     }
     
     pub fn swap(&self) {
+        *self.swapping.write() = true;
+    }
+    
+    pub fn update(&self) -> bool {
+        if !*self.swapping.read() {
+            return false;
+        }
+        *self.swapping.write() = false;
         let mut front = self.current_front.write();
         *front = !*front;
+        true
     }
 }
 
@@ -179,6 +189,7 @@ fn intersect(a: &Vertex, b: &Vertex, near: f32) -> Vertex {
             y: a.uv.y + (b.uv.y - a.uv.y) * t,
             ..Default::default()
         },
+        light: Float4::new(1.0, 1.0, 1.0, 0.0)
     }
 }
 
@@ -199,50 +210,27 @@ pub fn clip_triangle_near_plane_inplace(
     inside_count != 3
 }
 
-
-
-
-
-fn is_triangle_culled_inline(tri_center: Float4, radius: f32, tan_half_fov_y: f32, tan_half_fov_x: f32/*, fov_y: f32, aspect: f32*/) -> bool {
-    // Compute tangent of half FOV
-    //let tan_half_fov_y = (fov_y * 0.5).tan();
-    //let tan_half_fov_x = tan_half_fov_y * aspect;
-    
-    // X/Y/Z of the triangle center
+fn is_triangle_culled_inline(tri_center: Float4, radius: f32, tan_half_fov_y: f32, tan_half_fov_x: f32) -> bool {
     let x = tri_center.x;
     let y = tri_center.y;
     let z = tri_center.z;
-    
-    // Left plane: x >= -z * tan_half_fov_x
     let z_term = z * tan_half_fov_x;
     if x < -z_term - radius {
         return true;
     }
-    
-    // Right plane: x <= z * tan_half_fov_x
     if x > z_term + radius {
         return true;
     }
-    
-    // Bottom plane: y >= -z * tan_half_fov_y
     let z_term = z * tan_half_fov_y;
     if y < -z_term - radius {
         return true;
     }
     
-    // Top plane: y <= z * tan_half_fov_y
     if y > z_term + radius {
         return true;
     }
-    
-    // If you want, near/far culling can be added as simple comparisons
-    // e.g., if z > -near_plane - radius { return true; }
-    
     false
 }
-
-
-
 
 struct UnsafePtrWrapper<T> { ptr: T }
 impl<T> UnsafePtrWrapper<T> {
@@ -301,12 +289,12 @@ impl Mesh {
             self.dead.push(false);
             self.index_chunks.push(chunk_index);
         }
-        self.indices.append(indices);
+        self.indices.extend_from_slice(&indices);
     }
     
     pub fn push_vertex(&mut self, vertex: Vertex, owner: usize, chunk_index: usize) {
         self.vertices_original.push(vertex);
-        self.vertices.push(vertex);
+        //self.vertices.push(vertex);
         self.vertex_ownership.push(owner);
         self.vert_chunk_index.push(chunk_index)
     }
@@ -316,8 +304,8 @@ impl Mesh {
             self.vertex_ownership.push(owner);
             self.vert_chunk_index.push(chunk_index)
         }
-        self.vertices_original.append(vertices);
-        self.vertices.append(vertices);
+        self.vertices_original.extend_from_slice(&vertices);
+        //self.vertices.append(vertices);
     }
     
     pub fn chunk_ref(&self) -> &Vec<(Float4, Float4)> {
@@ -345,7 +333,7 @@ impl Mesh {
         self.mutated
     }
     
-    pub fn check_remesh(&mut self, /*shader_handler: &mut ShaderHandler,*/ window_size: (u32, u32), camera_position: Float4, camera_rotation: Float4, meshing_priority_min: usize, meshing_priority_max: usize) {
+    pub fn check_remesh(&mut self, /*shader_handler: &mut ShaderHandler,*/ window_size: (u32, u32), camera_position: Float4, camera_rotation: Float4, meshing_priority_min: usize, meshing_priority_max: usize, print_debug: bool) {
         if !self.mutated { return; }
         self.mutated = false;
         
@@ -384,6 +372,7 @@ impl Mesh {
         // replacing vertices with the transformations of the original vertices
         let projection_matrix = perspective(60_f32.to_radians(), window_size.0 as f32 / window_size.1 as f32, 0.1, 9999.0);
         
+        // creating slices which DO not overlap to ensure thread safety
         const THREAD_COUNT: usize = 8;  // seems to be a good number for the best speed, but idk
         let length = self.vertices_original.len();
         let mut slices = vec![];
@@ -400,6 +389,8 @@ impl Mesh {
         }
         
         let mut thread_handles = vec![];
+        // these pointers are safe as the data lives for the length of this class, but the pointers are used purely for part of the function call
+        // the pointers are only used in either immutable state where they all get cleaned up after use, or mutable state where the slices ensure no overlap
         let vert_orig_ptr = std::sync::Arc::new(UnsafePtrWrapper::new(self.vertices_original.as_ptr()));
         let vert_mut_ptr  = std::sync::Arc::new(UnsafePtrWrapper::new(self.vertices.as_mut_ptr()));
         let ownership_ptr  = std::sync::Arc::new(UnsafePtrWrapper::new(self.vertex_ownership.as_ptr()));
@@ -434,7 +425,7 @@ impl Mesh {
                         vertex.position.z - camera_position.z,
                         0.0,
                     ), &camera_rotation);
-                    vertices[i] = Vertex::new(vert, Float2::new(vertex.uv.x, vertex.uv.y));
+                    vertices[i] = Vertex::new(vert, Float2::new(vertex.uv.x, vertex.uv.y), vertex.light);
                 }
             });
             thread_handles.push(thread);
@@ -463,11 +454,15 @@ impl Mesh {
         let vertices_ptr = std::sync::Arc::new(UnsafePtrWrapper::new(self.vertices.as_ptr()));
         let normals_ptr = std::sync::Arc::new(UnsafePtrWrapper::new(self.normals.as_ptr()));
         let chunk_owner_ptr = std::sync::Arc::new(UnsafePtrWrapper::new(self.index_chunks.as_ptr()));
-        
+        let ownership_ptr  = std::sync::Arc::new(UnsafePtrWrapper::new(self.vertex_ownership.as_ptr()));
+ 
         let num_norms = self.normals.len();
-        let num_verts = self.vertices.len();
+        let num_verts = self.vertices_original.len();
         let mut handles = vec![];
+        let mut index_debug = 0;
+        let total_slices = slices_tri.len();
         for (start, end) in &slices_tri {
+            index_debug += 1;
             let culled = culled.clone();
             let (start, end) = (*start, *end);
             let dead_ptr = dead_ptr.clone();

@@ -28,12 +28,14 @@ static MAXIMUM_WINDOW_HEIGHT: u64 = 4096u64;
 static _GAME_VERSION: &'static str = "0.0.1-alpha";
 
 // gpu buffer sizes and stuff ig
-static MAX_VERTICES: u64 = 75_000_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
-static MAX_TRIANGLES: u64 = 50_000_000_u64;
+static MAX_VERTICES: u64 = 7_500_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
+static MAX_TRIANGLES: u64 = 5_000_000_u64;
 static MAX_TEXTURES: u64 = 1024_u64;
 
 static TILE_TEXTURE_WIDTH: u64 = 16u64;
 static TILE_TEXTURE_HEIGHT: u64 = 16u64;
+
+static FORCED_REMESH_DELAY: u64 = 30u64;
 
 static CELL_SIZE: u32 = 4;  // seems like a good size for performance; 16 was much slower; lower size = more cpu work, but faster gpu, higher size = less cpu work, but slower gpu
 
@@ -77,7 +79,7 @@ pub fn main() -> Result<(), String> {
         size_of::<u32   >() as u64,
         size_of::<Float4>() as u64,
         size_of::<Float4>() as u64,
-        size_of::<Float4>() as u64 * MAX_VERTICES,
+        size_of::<Vertex>() as u64 * MAX_VERTICES,
         size_of::<Float4>() as u64 * MAX_TRIANGLES,
         size_of::<Uint4 >() as u64 * MAX_TRIANGLES,
         size_of::<u32   >() as u64 * ((MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) * 64),
@@ -117,7 +119,7 @@ pub fn main() -> Result<(), String> {
     
     let depth_buffer = vec![f32::MAX; const { (MAXIMUM_WINDOW_WIDTH * MAXIMUM_WINDOW_HEIGHT) as usize }];
     
-    let mesh = std::sync::Arc::new(parking_lot::RwLock::new(Mesh::new(
+    let mesh = Mesh::new(
         true,
         vec![],
         vec![],
@@ -125,25 +127,23 @@ pub fn main() -> Result<(), String> {
         vec![],
         vec![Vertex::default(); MAX_VERTICES as usize],
         vec![],
-        normals,
+        normals.clone(),
         vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
         vec![],
         vec![],
         vec![],
-    )));
+    );
     let mesh = std::sync::Arc::new(MeshDoubleBuffer {
-        front: mesh.clone(),
-        back: mesh,
+        front: std::sync::Arc::new(parking_lot::RwLock::new(mesh.clone())),
+        back: std::sync::Arc::new(parking_lot::RwLock::new(mesh)),
         current_front: std::sync::Arc::new(parking_lot::RwLock::new(true)),
+        swapping: std::sync::Arc::new(parking_lot::RwLock::new(false)),
     });
     let mut chunks = vec![];
     for chunk_x in 0..16 {
         for chunk_z in 0..16 {
-            let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0), mesh.current().read().chunk_ref().len());
-            mesh.current().write().add_chunk(
-                Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0),
-                Float4::new(16.0, 16.0, 16.0, 0.0),
-            );
+            let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0), 0);
+            chunk.mutated = true;
             for x in 0..16 {
                 for z in 0..16 {
                     for y in 0..rand::random_range(2..6) {
@@ -154,19 +154,23 @@ pub fn main() -> Result<(), String> {
             chunks.push(chunk);
         }
     }
-    println!("Mesh has {} vertices and {} triangles.", mesh.current().read().vertices_original_ref().len(), mesh.current().read().indices_ref().len());
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    let processing_mutation = std::sync::Arc::new(parking_lot::RwLock::new(false));
+    let waiting_for_chunk_update = std::sync::Arc::new(parking_lot::RwLock::new(false));
     
+    let processing_mutation_clone = processing_mutation.clone();
+    let waiting_for_chunk_update_clone = waiting_for_chunk_update.clone();
     let thread_mesh = mesh.clone();
     let (mesh_update_sender, mesh_update_receiver) = crossbeam::channel::unbounded::<((u32, u32), Float4, Float4)>();
     let (mesh_complete_sender, mesh_complete_receiver) = crossbeam::channel::unbounded::<()>();
     let _mesh_handle = std::thread::spawn(move || {
         let mut priority_cycle = 0;
         loop {
+            if *waiting_for_chunk_update_clone.read() { continue; }
             let (window_size, cam_rot, cam_pos) = match mesh_update_receiver.recv() {
                 Ok(v) => v,
                 Err(_) => break,
             };  // blocking wait for a remesh signal
+            *processing_mutation_clone.write() = true;
             thread_mesh.current().write().check_remesh(window_size, cam_pos, cam_rot, match priority_cycle % 4 {
                 0 => 0,
                 1 => 0,
@@ -179,22 +183,63 @@ pub fn main() -> Result<(), String> {
                 2 => 65,
                 3 => 65,
                 _ => 0,
-            });
+            }, false);
             mesh_complete_sender.send(()).unwrap();
             priority_cycle += 1;
         }
     });
+    
+    let window_size_sync = std::sync::Arc::new(parking_lot::RwLock::new((WINDOW_START_WIDTH, WINDOW_START_HEIGHT)));
+    let camera_position_sync = std::sync::Arc::new(parking_lot::RwLock::new(camera_position.clone()));
+    let camera_rotation_sync = std::sync::Arc::new(parking_lot::RwLock::new(camera_rotation.clone()));
+
+    let processing_mutation_clone = processing_mutation.clone();
     let rebuild_mesh = mesh.clone();
     let (mesh_build_sender, mesh_build_receiver) = crossbeam::channel::unbounded::<()>();
+    let window_size_sync_clone = window_size_sync.clone();
+    let camera_position_sync_clone = camera_position_sync.clone();
+    let camera_rotation_sync_clone = camera_rotation_sync.clone();
+    let waiting_for_chunk_update_clone = waiting_for_chunk_update.clone();
+    let chunks = std::sync::Arc::new(parking_lot::RwLock::new(chunks));
+    let chunks_clone = chunks.clone();
     let _mesh_rebuild_handle = std::thread::spawn(move || {
-        let chunks = std::sync::Arc::new(parking_lot::RwLock::new(chunks));
         loop {
             // either on timeout or on signal, remesh all chunks
-            let _ = mesh_build_receiver.recv_timeout(std::time::Duration::from_secs(30));
-            for chunk in &mut *chunks.write() {
-                chunk.remesh_chunk(&mut rebuild_mesh.back(), 1.0, 0);
+            let _ = mesh_build_receiver.recv_timeout(std::time::Duration::from_secs(FORCED_REMESH_DELAY));
+            let write_lock = rebuild_mesh.back();
+            let mut write_lock = write_lock.write();
+            *write_lock = Mesh::new(
+                true,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![Vertex::default(); MAX_VERTICES as usize],
+                vec![],
+                normals.clone(),
+                vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
+                vec![],
+                vec![],
+                vec![],
+            );
+            for chunk in &mut *chunks_clone.write() {
+                chunk.chunk_index = write_lock.chunk_ref().len();
+                write_lock.add_chunk(
+                    chunk.position,
+                    Float4::new(16.0, 16.0, 16.0, 0.0),
+                );
+                chunk.remesh_chunk(&mut write_lock, 1.0, 0);
             }
+            write_lock.mutated(true);
+            write_lock.check_remesh(*window_size_sync_clone.read(), *camera_position_sync_clone.read(), *camera_rotation_sync_clone.read(), 0, usize::MAX, true);
             rebuild_mesh.swap();
+            while *processing_mutation_clone.read() {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            drop(write_lock);
+            *waiting_for_chunk_update_clone.write() = true;
+            println!("\n\n\nRemeshed\n\n\n");
+            //break;
         }
     });
     mesh_build_sender.send(()).unwrap();
@@ -208,28 +253,37 @@ pub fn main() -> Result<(), String> {
                 sdl2::event::Event::KeyDown { keycode, .. } => {
                     if let Some(key) = keycode {
                         let mut movement = Float4::new(0.0, 0.0, 0.0, 0.0);
+                        let mut blend = Float4::new(1.0, 1.0, 1.0, 0.0);
                         match key {
                             sdl2::keyboard::Keycode::A => {
                                 movement.x += 4.0;
+                                blend.y = 0.0;
                                 mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::D => {
                                 movement.x -= 4.0;
+                                blend.y = 0.0;
                                 mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::W => {
                                 movement.z += 4.0;
+                                blend.y = 0.0;
                                 mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::S => {
                                 movement.z -= 4.0;
+                                blend.y = 0.0;
                                 mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Space => {
                                 movement.y += 4.0;
+                                blend.x = 0.0;
+                                blend.z = 0.0;
                                 mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::LSHIFT => {
+                                blend.x = 0.0;
+                                blend.z = 0.0;
                                 movement.y -= 4.0;
                                 mesh.current().write().mutated(true);
                             },
@@ -251,7 +305,10 @@ pub fn main() -> Result<(), String> {
                             },
                             _ => {}
                         }
-                        let offset = rotate(movement, &camera_rotation.negate());
+                        let mut offset = rotate(movement, &camera_rotation.negate());
+                        offset.x = movement.x * (1.0 - blend.x) + offset.x * blend.x;
+                        offset.y = movement.y * (1.0 - blend.y) + offset.y * blend.y;
+                        offset.z = movement.z * (1.0 - blend.z) + offset.z * blend.z;
                         camera_position.x += offset.x;
                         camera_position.y += offset.y;
                         camera_position.z += offset.z;
@@ -274,6 +331,10 @@ pub fn main() -> Result<(), String> {
         if window_size.0 as u64 > MAXIMUM_WINDOW_WIDTH || window_size.1 as u64 > MAXIMUM_WINDOW_HEIGHT {
             return Err(format!("Window size exceeded maximum dimensions of {}x{}.", MAXIMUM_WINDOW_WIDTH, MAXIMUM_WINDOW_HEIGHT));
         }
+        
+        *window_size_sync.write() = window_size;
+        *camera_position_sync.write() = camera_position;
+        *camera_rotation_sync.write() = camera_rotation;
         
         // !====! Do Rendering Here! !====!
         
@@ -326,16 +387,17 @@ pub fn main() -> Result<(), String> {
             );
             
             // checking if the background thread finished remeshing (try_recv so it doesn't block if it's still processing)
-            if mesh_complete_receiver.try_recv().is_ok() {
+            if mesh_complete_receiver.try_recv().is_ok() || *waiting_for_chunk_update.read() {
+                if !*processing_mutation.read() && *waiting_for_chunk_update.read() { mesh.update(); }
+                *waiting_for_chunk_update.write() = false;
+                *processing_mutation.write() = false;
                 mesh.current().read().update_shader_buffers(&mut shader_handler, window_size, camera_rotation.clone());
+                *processing_mutation.write() = false;
             }
             
             let total_end = start.elapsed() - execution_end - execution_start;
             println!("Buffer Upload Time: {:?}, Execution Time: {:?}, Read In Time: {:?}", execution_start, execution_end, total_end);
         })?;
-        
-        
-        
         
         // !====! No Rendering Beyond Here !====!
         
