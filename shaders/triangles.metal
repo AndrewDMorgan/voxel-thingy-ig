@@ -51,7 +51,7 @@ kernel void ComputeShader (
         const uint4 triangle = triangles_buffer[tri_id];
         const float3 triangle_normal = normals[triangle.w & 0xFFFF].xyz;
         // I think that's working, but definitely verify bc/ I have no clue (orthographic projection makes this hard to see)
-        //if (metal::dot(triangle_normal, camera_rotation.xyz) >= 0.0) { continue; }  // continue;     make this work at some point ig
+        //if (metal::dot(triangle_normal, camera_rotation.xyz) >= 0.5) { continue; }  // continue;     make this work at some point ig
 
         device const Vertex* const tri_1 = &vertex_buffer[triangle.x];
         device const Vertex* const tri_2 = &vertex_buffer[triangle.y];

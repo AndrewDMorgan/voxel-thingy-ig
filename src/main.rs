@@ -8,7 +8,7 @@ use sdl2::pixels::PixelFormatEnum;
 use sdl2::video::WindowContext;
 use sdl2::rect::Rect;
 use shader_handling::{ShaderHandler, Shader};
-use crate::meshing::{rotate, Mesh};
+use crate::meshing::{rotate, Mesh, MeshDoubleBuffer};
 use crate::chunk::{generate_cube, Chunk};
 use crate::shader_handling::{Float4, Float4x4, Pipeline, Uchar4, Uint4, Vertex};
 
@@ -27,14 +27,15 @@ static MAXIMUM_WINDOW_HEIGHT: u64 = 4096u64;
 
 static _GAME_VERSION: &'static str = "0.0.1-alpha";
 
-static MAX_VERTICES: u64 = 250_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
-static MAX_TRIANGLES: u64 = 125_000_u64;
+// gpu buffer sizes and stuff ig
+static MAX_VERTICES: u64 = 75_000_000_u64;   // HOW?????? how did it even handle this while still be quick???????? that shouldn't work
+static MAX_TRIANGLES: u64 = 50_000_000_u64;
 static MAX_TEXTURES: u64 = 1024_u64;
 
 static TILE_TEXTURE_WIDTH: u64 = 16u64;
 static TILE_TEXTURE_HEIGHT: u64 = 16u64;
 
-static CELL_SIZE: u32 = 4;  // seems like a good size for performance; 16 was much slower
+static CELL_SIZE: u32 = 4;  // seems like a good size for performance; 16 was much slower; lower size = more cpu work, but faster gpu, higher size = less cpu work, but slower gpu
 
 pub fn main() -> Result<(), String> {
     // Initialize SDL2
@@ -86,6 +87,7 @@ pub fn main() -> Result<(), String> {
     ], "ComputeShader")?;
     let mut shader_handler = ShaderHandler::new(device, shader);
     
+    // todo! actually load textures
     let mut texture = vec![];
     for i in 0..=255 {
         if i / 16 > 4 {
@@ -104,9 +106,7 @@ pub fn main() -> Result<(), String> {
     
     let mut camera_position = Float4::new(0.0, 2.0, -2.0, 0.0);
     let mut camera_rotation = Float4::new(0.0, 0.0, 0.0, 0.0);
-    let mut vertex_buffer: Vec<Vertex> = vec![];
-    let mut triangles_buffer: Vec<Uint4> = vec![];
-    let mut normals: Vec<Float4> = vec![
+    let normals: Vec<Float4> = vec![
         Float4::new( 0.0,  1.0,  0.0, 0.0),
         Float4::new( 0.0, -1.0,  0.0, 0.0),
         Float4::new( 1.0,  0.0,  0.0, 0.0),
@@ -117,17 +117,33 @@ pub fn main() -> Result<(), String> {
     
     let depth_buffer = vec![f32::MAX; const { (MAXIMUM_WINDOW_WIDTH * MAXIMUM_WINDOW_HEIGHT) as usize }];
     
-    let mut mesh = Mesh {
-        vertices_original: vertex_buffer.clone(),
-        vertices: vec![Vertex::default(); MAX_VERTICES as usize],
-        indices: triangles_buffer,
+    let mesh = std::sync::Arc::new(parking_lot::RwLock::new(Mesh::new(
+        true,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![Vertex::default(); MAX_VERTICES as usize],
+        vec![],
         normals,
-        binned_indices: vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
-        mutated: true,
-    };
-    for chunk_x in 0..7 {
-        for chunk_z in 0..7 {
-            let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0));
+        vec![0u32; 64 * (MAXIMUM_WINDOW_WIDTH / CELL_SIZE as u64) as usize * (MAXIMUM_WINDOW_HEIGHT / CELL_SIZE as u64) as usize],
+        vec![],
+        vec![],
+        vec![],
+    )));
+    let mesh = std::sync::Arc::new(MeshDoubleBuffer {
+        front: mesh.clone(),
+        back: mesh,
+        current_front: std::sync::Arc::new(parking_lot::RwLock::new(true)),
+    });
+    let mut chunks = vec![];
+    for chunk_x in 0..16 {
+        for chunk_z in 0..16 {
+            let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0), mesh.current().read().chunk_ref().len());
+            mesh.current().write().add_chunk(
+                Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0),
+                Float4::new(16.0, 16.0, 16.0, 0.0),
+            );
             for x in 0..16 {
                 for z in 0..16 {
                     for y in 0..rand::random_range(2..6) {
@@ -135,11 +151,53 @@ pub fn main() -> Result<(), String> {
                     }
                 }
             }
-            chunk.remesh_chunk(&mut mesh, 1.0);
+            chunks.push(chunk);
         }
     }
-    println!("Mesh has {} vertices and {} triangles.", mesh.vertices_original.len(), mesh.indices.len());
+    println!("Mesh has {} vertices and {} triangles.", mesh.current().read().vertices_original_ref().len(), mesh.current().read().indices_ref().len());
     std::thread::sleep(std::time::Duration::from_secs(5));
+    
+    let thread_mesh = mesh.clone();
+    let (mesh_update_sender, mesh_update_receiver) = crossbeam::channel::unbounded::<((u32, u32), Float4, Float4)>();
+    let (mesh_complete_sender, mesh_complete_receiver) = crossbeam::channel::unbounded::<()>();
+    let _mesh_handle = std::thread::spawn(move || {
+        let mut priority_cycle = 0;
+        loop {
+            let (window_size, cam_rot, cam_pos) = match mesh_update_receiver.recv() {
+                Ok(v) => v,
+                Err(_) => break,
+            };  // blocking wait for a remesh signal
+            thread_mesh.current().write().check_remesh(window_size, cam_pos, cam_rot, match priority_cycle % 4 {
+                0 => 0,
+                1 => 0,
+                2 => 0,
+                3 => 0,
+                _ => 0,
+            }, match priority_cycle % 4 {
+                0 => 65,
+                1 => 65,
+                2 => 65,
+                3 => 65,
+                _ => 0,
+            });
+            mesh_complete_sender.send(()).unwrap();
+            priority_cycle += 1;
+        }
+    });
+    let rebuild_mesh = mesh.clone();
+    let (mesh_build_sender, mesh_build_receiver) = crossbeam::channel::unbounded::<()>();
+    let _mesh_rebuild_handle = std::thread::spawn(move || {
+        let chunks = std::sync::Arc::new(parking_lot::RwLock::new(chunks));
+        loop {
+            // either on timeout or on signal, remesh all chunks
+            let _ = mesh_build_receiver.recv_timeout(std::time::Duration::from_secs(30));
+            for chunk in &mut *chunks.write() {
+                chunk.remesh_chunk(&mut rebuild_mesh.back(), 1.0, 0);
+            }
+            rebuild_mesh.swap();
+        }
+    });
+    mesh_build_sender.send(()).unwrap();
     
     // --- Main loop ---
     'running: loop {
@@ -153,43 +211,43 @@ pub fn main() -> Result<(), String> {
                         match key {
                             sdl2::keyboard::Keycode::A => {
                                 movement.x += 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::D => {
                                 movement.x -= 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::W => {
                                 movement.z += 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::S => {
                                 movement.z -= 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Space => {
                                 movement.y += 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::LSHIFT => {
                                 movement.y -= 4.0;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Left => {
                                 camera_rotation.y -= 0.1;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Right => {
                                 camera_rotation.y += 0.1;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Up => {
                                 camera_rotation.x += 0.025;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             sdl2::keyboard::Keycode::Down => {
                                 camera_rotation.x -= 0.025;
-                                mesh.mutated = true;
+                                mesh.current().write().mutated(true);
                             },
                             _ => {}
                         }
@@ -206,7 +264,7 @@ pub fn main() -> Result<(), String> {
         // checking the surface texture's size
         let window_size = window_surface.output_size()?;
         if surface_texture_size != window_size {
-            mesh.mutated = true;
+            mesh.current().write().mutated(true);
             surface_texture = texture_creator
                 .create_texture(PixelFormatEnum::RGB24, TextureAccess::Streaming, window_size.0, window_size.1)
                 .map_err(|e| e.to_string())?;
@@ -229,13 +287,10 @@ pub fn main() -> Result<(), String> {
             shader_handler.get_shader().update_buffer(1, window_size.0 ).unwrap();
             shader_handler.get_shader().update_buffer(2, window_size.1 ).unwrap();
             
-            mesh.check_remesh(&mut shader_handler, window_size, camera_position.clone(), camera_rotation.clone());
-            
             shader_handler.get_shader().update_buffer_slice(10, &depth_buffer[0..(window_size.0 * window_size.1) as usize]).unwrap();
             shader_handler.get_shader().update_buffer_slice(11, pixels).unwrap();
             
             let grid_size = metal::MTLSize::new(
-                //metal::NSUInteger::from(triangles_buffer.len() as u64),
                 metal::NSUInteger::from((window_size.0 as f32 / CELL_SIZE as f32).ceil() as u64),
                 metal::NSUInteger::from((window_size.1 as f32 / CELL_SIZE as f32).ceil() as u64),
                 metal::NSUInteger::from(1u64),
@@ -249,10 +304,16 @@ pub fn main() -> Result<(), String> {
             
             let execution_start = start.elapsed();
             
-            shader_handler.get_shader().execute::<()>(grid_size, thread_group_size, Some(|| {
+            shader_handler.get_shader().execute(grid_size, thread_group_size, Some(|| {
                 // runs while rendering is happening
-                Ok(())
-            })).unwrap();
+                
+                // checking if the mesh was mutated, and if so, sending a remesh signal for the background thread
+                if let Some(mesh) = mesh.current().try_read() {
+                    if mesh.was_mutated() {
+                        mesh_update_sender.send((window_size, camera_rotation.clone(), camera_position.clone())).unwrap();
+                    }
+                }
+            }));
             
             let execution_end = start.elapsed() - execution_start;
             
@@ -264,9 +325,18 @@ pub fn main() -> Result<(), String> {
                 }
             );
             
+            // checking if the background thread finished remeshing (try_recv so it doesn't block if it's still processing)
+            if mesh_complete_receiver.try_recv().is_ok() {
+                mesh.current().read().update_shader_buffers(&mut shader_handler, window_size, camera_rotation.clone());
+            }
+            
             let total_end = start.elapsed() - execution_end - execution_start;
             println!("Buffer Upload Time: {:?}, Execution Time: {:?}, Read In Time: {:?}", execution_start, execution_end, total_end);
         })?;
+        
+        
+        
+        
         // !====! No Rendering Beyond Here !====!
         
         // clearing and drawing the texture
@@ -278,5 +348,6 @@ pub fn main() -> Result<(), String> {
         
         let frame_time = frame_start.elapsed();
         println!("Frame Time: {:?}\nFPS: {}", frame_time, 1.0 / frame_time.as_secs_f32());
-    } Ok(())
+    }
+    Ok(())
 }

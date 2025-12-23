@@ -54,6 +54,10 @@ impl Float4 {
         }
     }
     
+    pub fn dot(self, other: &Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+    
     pub fn normalized(self) -> Self {
         let length = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
         if length == 0.0 {
@@ -200,7 +204,7 @@ impl Shader {
     }
     
     /// Executes the shader with the given grid and threadgroup sizes
-    pub fn execute<'a, T>(&self, grid_size: MTLSize, threadgroup_size: MTLSize, callback: Option<impl FnOnce() -> Result<(), T> + 'a>) -> Result<(), T> {
+    pub fn execute(&self, grid_size: MTLSize, threadgroup_size: MTLSize, callback: Option<impl FnOnce() -> ()>) {
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_state);
@@ -214,13 +218,9 @@ impl Shader {
         encoder.end_encoding();
         command_buffer.commit();
         
-        let result = {
-            if let Some(callback) = callback { callback() }
-            else { Ok(()) }
-        };
+        if let Some(callback) = callback { callback() }
         
         command_buffer.wait_until_completed();
-        result
     }
     
     /// Gets a mutable pointer to the contents of the specified buffer
