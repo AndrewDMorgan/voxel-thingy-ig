@@ -41,6 +41,13 @@ pub struct Uint4 {
 }
 
 impl Float4 {
+    pub fn distance(&self, other: &Self) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+    
     pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
         Float4 { x, y, z, w }
     }

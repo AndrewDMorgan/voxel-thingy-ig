@@ -459,10 +459,7 @@ impl Mesh {
         let num_norms = self.normals.len();
         let num_verts = self.vertices_original.len();
         let mut handles = vec![];
-        let mut index_debug = 0;
-        let total_slices = slices_tri.len();
         for (start, end) in &slices_tri {
-            index_debug += 1;
             let culled = culled.clone();
             let (start, end) = (*start, *end);
             let dead_ptr = dead_ptr.clone();
@@ -547,7 +544,7 @@ impl Mesh {
                 let vertices = std::slice::from_raw_parts_mut(vert_mut_ptr.unwrap().add(start), len);
                 let ownership = std::slice::from_raw_parts(ownership_ptr.unwrap().add(start), len);
                 let vert_chunk_index = std::slice::from_raw_parts(vert_chunk_index_ptr.unwrap().add(start), len);
-                let is_chunk_culled = std::slice::from_raw_parts(is_chunk_culled_ptr.unwrap().add(start), culled_chunks_len);
+                let is_chunk_culled = std::slice::from_raw_parts(is_chunk_culled_ptr.unwrap(), culled_chunks_len);
                 for (i, vertex) in vertices.iter_mut().enumerate() {
                     if is_chunk_culled[vert_chunk_index[i]] || ownership[i] < meshing_priority_min || ownership[i] > meshing_priority_max {
                         continue;  // using the old results (hopefully they're ok, sometimes a complete remesh will be necessary though)

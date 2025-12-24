@@ -35,7 +35,7 @@ static MAX_TEXTURES: u64 = 1024_u64;
 static TILE_TEXTURE_WIDTH: u64 = 16u64;
 static TILE_TEXTURE_HEIGHT: u64 = 16u64;
 
-static FORCED_REMESH_DELAY: u64 = 30u64;
+static FORCED_REMESH_DELAY: u64 = 1u64;
 
 static CELL_SIZE: u32 = 4;  // seems like a good size for performance; 16 was much slower; lower size = more cpu work, but faster gpu, higher size = less cpu work, but slower gpu
 
@@ -140,13 +140,13 @@ pub fn main() -> Result<(), String> {
         swapping: std::sync::Arc::new(parking_lot::RwLock::new(false)),
     });
     let mut chunks = vec![];
-    for chunk_x in 0..16 {
-        for chunk_z in 0..16 {
+    for chunk_x in 0..64 {
+        for chunk_z in 0..64 {
             let mut chunk = Chunk::new(Float4::new(chunk_x as f32 * 16.0, 0.0, chunk_z as f32 * 16.0, 0.0), 0);
             chunk.mutated = true;
             for x in 0..16 {
                 for z in 0..16 {
-                    for y in 0..rand::random_range(2..6) {
+                    for y in 0..rand::random_range(10..14) {
                         chunk.tile_data[x][y][z] = 1;  // setting some tiles to be solid
                     }
                 }
@@ -154,6 +154,7 @@ pub fn main() -> Result<(), String> {
             chunks.push(chunk);
         }
     }
+    
     let processing_mutation = std::sync::Arc::new(parking_lot::RwLock::new(false));
     let waiting_for_chunk_update = std::sync::Arc::new(parking_lot::RwLock::new(false));
     
@@ -178,11 +179,11 @@ pub fn main() -> Result<(), String> {
                 3 => 0,
                 _ => 0,
             }, match priority_cycle % 4 {
-                0 => 65,
-                1 => 65,
-                2 => 65,
-                3 => 65,
-                _ => 0,
+                0 => 6*0 + usize::MAX,
+                1 => 25*0 + usize::MAX,
+                2 => 55*0 + usize::MAX,
+                3 => 128*0 + usize::MAX,
+                _ => usize::MAX,
             }, false);
             mesh_complete_sender.send(()).unwrap();
             priority_cycle += 1;
@@ -192,7 +193,7 @@ pub fn main() -> Result<(), String> {
     let window_size_sync = std::sync::Arc::new(parking_lot::RwLock::new((WINDOW_START_WIDTH, WINDOW_START_HEIGHT)));
     let camera_position_sync = std::sync::Arc::new(parking_lot::RwLock::new(camera_position.clone()));
     let camera_rotation_sync = std::sync::Arc::new(parking_lot::RwLock::new(camera_rotation.clone()));
-
+    
     let processing_mutation_clone = processing_mutation.clone();
     let rebuild_mesh = mesh.clone();
     let (mesh_build_sender, mesh_build_receiver) = crossbeam::channel::unbounded::<()>();
@@ -222,13 +223,26 @@ pub fn main() -> Result<(), String> {
                 vec![],
                 vec![],
             );
+            let cam_pos = *camera_position_sync_clone.read();
             for chunk in &mut *chunks_clone.write() {
                 chunk.chunk_index = write_lock.chunk_ref().len();
                 write_lock.add_chunk(
                     chunk.position,
                     Float4::new(16.0, 16.0, 16.0, 0.0),
                 );
-                chunk.remesh_chunk(&mut write_lock, 1.0, 0);
+                let distance = cam_pos.distance(&Float4::new(
+                    chunk.position.x + 8.0,
+                    chunk.position.y + 8.0,
+                    chunk.position.z + 8.0,
+                    0.0,
+                ));
+                chunk.remesh_chunk(&mut write_lock, distance as usize / 4, match distance {
+                    0.0..=32.0  => 0,
+                    32.0..=64.0 => 1,
+                    64.0..=128.0 => 2,
+                    128.0..=256.0 => 3,
+                    _ => 4,
+                });
             }
             write_lock.mutated(true);
             write_lock.check_remesh(*window_size_sync_clone.read(), *camera_position_sync_clone.read(), *camera_rotation_sync_clone.read(), 0, usize::MAX, true);
@@ -303,6 +317,20 @@ pub fn main() -> Result<(), String> {
                                 camera_rotation.x -= 0.025;
                                 mesh.current().write().mutated(true);
                             },
+                            /*sdl2::keyboard::Keycode::Equals => {
+                                let current = *chunk_lod_res_temp.read();
+                                if current < 4 {
+                                    *chunk_lod_res_temp.write() = current + 1;
+                                    mesh_build_sender.send(()).unwrap();
+                                }
+                            },
+                            sdl2::keyboard::Keycode::MINUS => {
+                                let current = *chunk_lod_res_temp.read();
+                                if current > 0 {
+                                    *chunk_lod_res_temp.write() = current - 1;
+                                    mesh_build_sender.send(()).unwrap();
+                                }
+                            },*/
                             _ => {}
                         }
                         let mut offset = rotate(movement, &camera_rotation.negate());
